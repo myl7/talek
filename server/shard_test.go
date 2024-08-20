@@ -6,13 +6,14 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"sync"
 	"time"
+
+	"testing"
 
 	"github.com/privacylab/talek/common"
 	_ "github.com/privacylab/talek/pir/pircpu"
 )
-
-import "testing"
 
 func fromEnvOrDefault(envKey string, defaultVal int) int {
 	if os.Getenv(envKey) != "" {
@@ -91,56 +92,97 @@ func BenchmarkShard(b *testing.B) {
 	readsPerWrite := fromEnvOrDefault("READS_PER_WRITE", 20)
 
 	conf := testConf()
-	shard := NewShard("Test Shard", "cpu.0", conf)
-	if shard == nil {
-		b.Error("Failed to create shard.")
+
+	readOnly := false
+	readOnlyS, ok := os.LookupEnv("READ_ONLY")
+	if ok && readOnlyS != "" {
+		readOnly = true
+	}
+
+	threadNumS, ok := os.LookupEnv("THREAD_NUM")
+	if !ok {
+		b.Error("THREAD_NUM not set")
 		return
 	}
-
-	replychan := make(chan *common.BatchReadReply)
-
-	//A default write request
-	stdWrite := common.WriteArgs{
-		Bucket1:        0,
-		Bucket2:        1,
-		Data:           bytes.NewBufferString("Magic").Bytes(),
-		InterestVector: []byte{},
-	}
-	shardWrite := &common.ReplicaWriteArgs{
-		WriteArgs: stdWrite,
-		EpochFlag: false,
+	threadNum, err := strconv.Atoi(threadNumS)
+	if err != nil {
+		panic(err)
 	}
 
-	//A default read request
-	reqs := make([]common.PirArgs, conf.ReadBatch)
-	rv := make([]byte, int(conf.NumBuckets))
-	for i := 0; i < len(rv); i++ {
-		rv[i] = byte(rand.Int())
+	shards := make([]*Shard, threadNum)
+	for i := 0; i < threadNum; i++ {
+		shards[i] = NewShard("Test Shard", "cpu.0", conf)
+		if shards[i] == nil {
+			b.Error("Failed to create shard.")
+			return
+		}
 	}
-	req := common.PirArgs{RequestVector: rv}
-	for i := 0; i < conf.ReadBatch; i++ {
-		reqs[i] = req
-	}
-	stdRead := &DecodedBatchReadRequest{reqs, replychan}
 
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		if i%readsPerWrite == 0 {
-			stdWrite.Bucket1 = uint64(rand.Int()) % conf.NumBuckets
-			stdWrite.Bucket2 = uint64(rand.Int()) % conf.NumBuckets
-			shard.Write(shardWrite)
-		} else {
-			shard.BatchRead(stdRead)
-			reply := <-replychan
+	inputChan := make(chan int)
 
-			if reply == nil || reply.Err != "" {
-				b.Error("Read failed.")
-			}
+	go func() {
+		for i := 0; i < b.N*readsPerWrite; i++ {
+			inputChan <- i
 		}
-		b.SetBytes(int64(1))
+		for i := 0; i < threadNum; i++ {
+			inputChan <- -1
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < threadNum; i++ {
+		wg.Add(1)
+		go func(shard *Shard) {
+			defer wg.Done()
+			for i := range inputChan {
+				if i == -1 {
+					break
+				}
+
+				if i%readsPerWrite == 0 && !readOnly {
+					stdWrite := common.WriteArgs{
+						Bucket1:        0,
+						Bucket2:        1,
+						Data:           bytes.NewBufferString("Magic").Bytes(),
+						InterestVector: []byte{},
+					}
+					shardWrite := &common.ReplicaWriteArgs{
+						WriteArgs: stdWrite,
+						EpochFlag: false,
+					}
+
+					stdWrite.Bucket1 = uint64(rand.Int()) % conf.NumBuckets
+					stdWrite.Bucket2 = uint64(rand.Int()) % conf.NumBuckets
+					shard.Write(shardWrite)
+				} else {
+					reqs := make([]common.PirArgs, conf.ReadBatch)
+					rv := make([]byte, int(conf.NumBuckets))
+					for i := 0; i < len(rv); i++ {
+						rv[i] = byte(rand.Int())
+					}
+					req := common.PirArgs{RequestVector: rv}
+					for i := 0; i < conf.ReadBatch; i++ {
+						reqs[i] = req
+					}
+					replychan := make(chan *common.BatchReadReply)
+					stdRead := &DecodedBatchReadRequest{reqs, replychan}
+
+					shard.BatchRead(stdRead)
+					reply := <-replychan
+
+					if reply == nil || reply.Err != "" {
+						b.Error("Read failed.")
+					}
+				}
+			}
+		}(shards[i])
 	}
+	wg.Wait()
 
 	fmt.Printf("Benchmark called close w N=%d\n", b.N)
-	shard.Close()
+	for shard := range shards {
+		shards[shard].Close()
+	}
 }
