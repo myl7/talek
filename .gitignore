@@ -15,3 +15,7 @@ pird/pird
 # Coverage
 overalls.coverprofile
 profile.coverprofile
+
+# IDE
+.vscode
+.idea
